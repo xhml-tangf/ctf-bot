@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+optuna.db
+params.json
+ctf_bot_bundled.py
