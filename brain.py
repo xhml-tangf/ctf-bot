@@ -1,64 +1,20 @@
 import math
+import heapq
 from config import FLAG_Z, GOLD_Z, ARENA_X, ARENA_Z
 
+JAIL_LEFT = ((-18, -14), (26, 30))
+JAIL_RIGHT = ((14, 18), (26, 30))
 
-def sub_v(v1, v2): return (v1[0]-v2[0], v1[1]-v2[1])
-def len_v(v): return math.hypot(v[0], v[1])
-def norm_v(v):
-    l = len_v(v)
-    return (0, 0) if l == 0 else (v[0]/l, v[1]/l)
-def dot_v(v1, v2): return v1[0]*v2[0] + v1[1]*v2[1]
+COW_REPEL_R = 1.0
+BUG_REPEL_R = 2.5
+REPEL_K = 8.0
+REPEL_STRENGTH = 5.0
+GHOST_RANGE = 5.0
+ATTACK_RANGE = 3.0
+CHASE_LOCK_R = 2.0
 
-
-def expert_agent_tick(my_pos, my_vel, my_has_flag, enemies, target_pos, is_hunting=False):
-    rel_target = sub_v(target_pos, my_pos)
-    main_force = norm_v(rel_target)
-    jump = False
-    force_jump = False
-
-    for e in enemies:
-        rel_pos = sub_v(e['pos'], my_pos)
-        dist = len_v(rel_pos)
-
-        if is_hunting and dist < 1.5 and not e.get('is_parasitized'):
-            dx, dz = abs(rel_pos[0]), abs(rel_pos[1])
-            if dx > dz:
-                return (0.0, math.copysign(1.0, rel_pos[1]), False, None)
-            else:
-                return (math.copysign(1.0, rel_pos[0]), 0.0, False, e.get('id'))
-
-        if 0 < dist < 4.0 and not e.get('is_parasitized'):
-            rel_vel = sub_v(e['vel'], my_vel)
-            approach_rate = dot_v(norm_v(rel_pos), rel_vel)
-            if approach_rate > 0:
-                lat1 = (-rel_pos[1], rel_pos[0])
-                lat2 = (rel_pos[1], -rel_pos[0])
-                lat = lat1 if dot_v(norm_v(lat1), main_force) > dot_v(norm_v(lat2), main_force) else lat2
-                lat = norm_v(lat)
-                mag = (4.0 - dist) * approach_rate * (0.5 if is_hunting else 1.0)
-                main_force = (main_force[0] + lat[0] * mag, main_force[1] + lat[1] * mag)
-
-        if e.get('is_parasitized') and 0 < dist < 5.0:
-            away = norm_v(rel_pos)
-            mag = (5.0 - dist) * 2.0
-            main_force = (main_force[0] + away[0] * mag, main_force[1] + away[1] * mag)
-
-    final_vec = norm_v(main_force)
-    if len_v(my_vel) < 0.1 and len_v(rel_target) > 1.0:
-        jump = True
-    if my_has_flag:
-        force_jump = True
-
-    atk = None
-    for e in enemies:
-        if e.get('is_parasitized'):
-            continue
-        d = len_v(sub_v(e['pos'], my_pos))
-        if d < 3.0:
-            atk = e.get('id')
-            break
-
-    return (final_vec[1], final_vec[0], jump or force_jump, atk)
+DIRS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)]
 
 
 class Brain:
@@ -85,10 +41,12 @@ class Brain:
         self.initialized = False
         self.tick_count = 0
         self.prev_hasFlag = False
-        self.prev_pos = None
-        self.my_vel = (0.0, 0.0)
-        self.entity_prev = {}
         self.atk_idx = 0
+        self.path = None
+        self.path_idx = 0
+        self.last_recompute = 0
+        self._prev_ex = {}
+        self._prev_ez = {}
 
     def detect_ground_y(self):
         px, py, pz = self.b.location
@@ -104,6 +62,10 @@ class Brain:
     def on_my_half(self, x):
         return (x < 0) == (self.my_side == 'left')
 
+    def in_jail(self, px, pz):
+        xr, zr = JAIL_LEFT if self.my_side == 'left' else JAIL_RIGHT
+        return xr[0] <= px <= xr[1] and zr[0] <= pz <= zr[1]
+
     def is_enemy_player(self, e):
         if 'player' not in e.type.lower():
             return False
@@ -117,27 +79,114 @@ class Brain:
     def is_infected(self, e):
         return e.helmet is not None and 'leather_helmet' in e.helmet.lower()
 
-    def is_mob(self, e):
+    def is_cow(self, e):
         t = e.type.lower()
-        return 'mooshroom' in t or 'cow' in t or 'silverfish' in t
+        return 'mooshroom' in t or 'cow' in t
+
+    def is_bug(self, e):
+        return 'silverfish' in e.type.lower()
+
+    def is_mob(self, e):
+        return self.is_cow(e) or self.is_bug(e)
+
+    def threat_type(self, e):
+        if self.is_cow(e):
+            return 'cow'
+        if self.is_bug(e) or (self.is_infected(e) and 'player' in e.type.lower()):
+            return 'bug'
+        return None
+
+    def is_solid_at(self, x, y, z):
+        blk = self.b.get_block(x, y, z)
+        if blk is None:
+            return False
+        bt = blk.type.lower()
+        if 'fence_gate' in bt:
+            return False
+        return not blk.passable
+
+    def is_obstacle_cell(self, x, z):
+        for yy in (self.G, self.G + 1, self.G + 2):
+            if self.is_solid_at(x, yy, z):
+                return True
+        return False
+
+    def get_obstacle_cells(self):
+        cells = set()
+        for e in self.b.entities.values():
+            if self.is_cow(e):
+                cells.add((int(math.floor(e.x)), int(math.floor(e.z))))
+            elif self.is_bug(e) or (self.is_infected(e) and 'player' in e.type.lower()):
+                cx = int(math.floor(e.x))
+                cz = int(math.floor(e.z))
+                for dx in range(-2, 3):
+                    for dz in range(-2, 3):
+                        if dx * dx + dz * dz <= 2.25 * 2.25:
+                            cells.add((cx + dx, cz + dz))
+        px, py, pz = self.b.location
+        rx = int(math.floor(px)) + 20
+        rz = int(math.floor(pz)) + 40
+        for x in range(max(-ARENA_X, rx - 20), min(ARENA_X + 1, rx + 21)):
+            for z in range(max(-ARENA_Z, rz - 20), min(ARENA_Z + 1, rz + 21)):
+                if (x, z) not in cells and self.is_obstacle_cell(x, z):
+                    cells.add((x, z))
+        return cells
+
+    def bfs(self, start, targets):
+        obstacles = self.get_obstacle_cells()
+        if start in targets:
+            return [start]
+        heap = [(0.0, start)]
+        came = {start: None}
+        g = {start: 0.0}
+        best = None
+        while heap:
+            cost, cell = heapq.heappop(heap)
+            if cell in targets:
+                best = cell
+                break
+            if cost > g.get(cell, 1e18):
+                continue
+            cx, cz = cell
+            for dx, dz, dc in DIRS:
+                nx, nz = cx + dx, cz + dz
+                if nx < -ARENA_X or nx > ARENA_X or nz < -ARENA_Z or nz > ARENA_Z:
+                    continue
+                if (nx, nz) in obstacles:
+                    continue
+                if dx != 0 and dz != 0:
+                    if (cx + dx, cz) in obstacles and (cx, cz + dz) in obstacles:
+                        continue
+                nc = cost + dc
+                if nc < g.get((nx, nz), 1e18):
+                    g[(nx, nz)] = nc
+                    came[(nx, nz)] = cell
+                    heapq.heappush(heap, (nc, (nx, nz)))
+        if best is None:
+            return None
+        path = []
+        c = best
+        while c is not None:
+            path.append(c)
+            c = came[c]
+        path.reverse()
+        return path
 
     def flag_available(self, pos):
-        fx, fz = pos
-        g0 = self.b.get_block(fx, self.G, fz)
-        f2 = self.b.get_block(fx, self.G + 2, fz)
+        g0 = self.b.get_block(pos[0], self.G, pos[1])
+        f2 = self.b.get_block(pos[0], self.G + 2, pos[1])
         if g0 is None or f2 is None:
             return True
         return 'copper' in g0.type.lower() and 'banner' in f2.type.lower()
 
     def gold_empty(self, pos):
-        gx, gz = pos
-        g0 = self.b.get_block(gx, self.G, gz)
+        g0 = self.b.get_block(pos[0], self.G, pos[1])
         if g0 is None:
             return True
         if 'gold' not in g0.type.lower():
             return False
-        a1 = self.b.get_block(gx, self.G + 1, gz)
-        a2 = self.b.get_block(gx, self.G + 2, gz)
+        a1 = self.b.get_block(pos[0], self.G + 1, pos[1])
+        a2 = self.b.get_block(pos[0], self.G + 2, pos[1])
         if a1 is None or a2 is None:
             return True
         if 'banner' in a1.type.lower() or 'banner' in a2.type.lower():
@@ -164,6 +213,27 @@ class Brain:
                             result.add((wx, wz))
         return result
 
+    def scan_gold(self):
+        result = set()
+        cy = self.G >> 4
+        for (cx, kcy, cz), chunk in self.b.chunks.items():
+            if kcy != cy:
+                continue
+            for lx in range(16):
+                for lz in range(16):
+                    wx = (cx << 4) + lx
+                    wz = (cz << 4) + lz
+                    if wx < -ARENA_X or wx > ARENA_X or wz < -ARENA_Z or wz > ARENA_Z:
+                        continue
+                    gblk = chunk.get_block(wx, self.G, wz)
+                    if gblk and 'gold' in gblk.type.lower():
+                        a1 = chunk.get_block(wx, self.G + 1, wz)
+                        a2 = chunk.get_block(wx, self.G + 2, wz)
+                        if a1 and a2 and a1.passable and a2.passable:
+                            if 'banner' not in a1.type.lower() and 'banner' not in a2.type.lower():
+                                result.add((wx, wz))
+        return result
+
     def available_flags(self):
         result = set()
         if self.map_fixed:
@@ -176,31 +246,14 @@ class Brain:
         return result
 
     def empty_gold(self):
-        result = set()
         if self.map_fixed:
-            for pos in self.my_golds:
-                if self.gold_empty(pos):
-                    result.add(pos)
-        else:
-            cy = self.G >> 4
-            for (cx, kcy, cz), chunk in self.b.chunks.items():
-                if kcy != cy:
-                    continue
-                for lx in range(16):
-                    for lz in range(16):
-                        wx = (cx << 4) + lx
-                        wz = (cz << 4) + lz
-                        if wx < -ARENA_X or wx > ARENA_X or wz < -ARENA_Z or wz > ARENA_Z:
-                            continue
-                        gblk = chunk.get_block(wx, self.G, wz)
-                        if gblk and 'gold' in gblk.type.lower():
-                            a1 = chunk.get_block(wx, self.G + 1, wz)
-                            a2 = chunk.get_block(wx, self.G + 2, wz)
-                            if a1 and a2 and a1.passable and a2.passable:
-                                if 'banner' not in a1.type.lower() and 'banner' not in a2.type.lower():
-                                    result.add((wx, wz))
-            my_half = self.my_side == 'left'
-            result = {g for g in result if (g[0] < 0) == my_half}
+            result = {pos for pos in self.my_golds if self.gold_empty(pos)}
+            if self.coord:
+                result = {g for g in result if self.coord.gold.get(g) in (None, self.my_name)}
+            return result
+        result = self.scan_gold()
+        my_half = self.my_side == 'left'
+        result = {g for g in result if (g[0] < 0) == my_half}
         if self.coord:
             result = {g for g in result if self.coord.gold.get(g) in (None, self.my_name)}
         return result
@@ -229,50 +282,131 @@ class Brain:
                     return best
             return (self.my_gold_x, 0)
         invader = self.nearest_enemy_in_my_half()
-        if invader is not None:
-            d = math.hypot(invader.x - px, invader.z - pz)
-            if d < 10:
-                return (invader.x, invader.z)
+        if invader and math.hypot(invader.x - px, invader.z - pz) < 10:
+            return (invader.x, invader.z)
         flags = self.available_flags()
         if flags:
-            my_half = [f for f in flags if self.on_my_half(f[0])]
-            other = [f for f in flags if not self.on_my_half(f[0])]
             dk = lambda f: (f[0]-px)**2 + (f[1]-pz)**2
-            for f in sorted(my_half, key=dk) + sorted(other, key=dk):
+            mh = sorted([f for f in flags if self.on_my_half(f[0])], key=dk)
+            ot = sorted([f for f in flags if not self.on_my_half(f[0])], key=dk)
+            for f in mh + ot:
                 if not self.coord or self.coord.claim(f, self.my_name, False):
                     return f
         return (self.enemy_flag_x, 0)
 
-    def build_enemies(self, px, pz):
-        enemies = []
-        for eid, e in self.b.entities.items():
-            ex, ez = e.x, e.z
-            prev = self.entity_prev.get(eid, (ex, ez))
-            ev = (ex - prev[0], ez - prev[1])
-            self.entity_prev[eid] = (ex, ez)
+    def targets_around(self, pos, include_center):
+        cells = set()
+        for dx in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if not include_center and dx == 0 and dz == 0:
+                    continue
+                cells.add((pos[0] + dx, pos[1] + dz))
+        return cells
 
-            if self.is_enemy_player(e) and not self.is_infected(e):
-                has_flag = bool(e.helmet and 'banner' in e.helmet.lower())
-                enemies.append({'pos': (ex, ez), 'vel': ev, 'has_flag': has_flag,
-                                'is_parasitized': False, 'id': eid})
-            elif self.is_mob(e):
-                enemies.append({'pos': (ex, ez), 'vel': ev, 'has_flag': False,
-                                'is_parasitized': False, 'id': eid})
-            elif self.is_infected(e) and 'player' in e.type.lower():
-                nm = e.name or ""
-                if nm != self.my_name and nm not in self.teammate_names:
-                    enemies.append({'pos': (ex, ez), 'vel': ev, 'has_flag': False,
-                                    'is_parasitized': True, 'id': eid})
-        return enemies
-
-    def check_hunt(self, enemies, px, pz, hasFlag):
-        for e in enemies:
-            if e.get('is_parasitized'):
+    def compute_repulsion(self, px, pz):
+        rx = rz = 0.0
+        in_field = False
+        for e in self.b.entities.values():
+            tt = self.threat_type(e)
+            if tt is None:
                 continue
-            d = len_v(sub_v(e['pos'], (px, pz)))
-            if (e.get('has_flag') and d < 15) or (d < 5 and not hasFlag):
-                return True, (e['pos'][0] + e['vel'][0] * 5, e['pos'][1] + e['vel'][1] * 5)
-        return False, None
+            d = math.hypot(px - e.x, pz - e.z)
+            R = COW_REPEL_R if tt == 'cow' else BUG_REPEL_R
+            if 0.01 < d < R:
+                mag = REPEL_STRENGTH * math.exp(-d * REPEL_K)
+                rx += (px - e.x) / d * mag
+                rz += (pz - e.z) / d * mag
+                in_field = True
+        return rx, rz, in_field
+
+    def nearest_enemy_dist(self, px, pz):
+        best = 1e18
+        for e in self.b.entities.values():
+            if not self.is_enemy_player(e) or self.is_infected(e):
+                continue
+            d = math.hypot(e.x - px, e.z - pz)
+            if d < best:
+                best = d
+        return best
+
+    def nearest_attack_target(self, px, pz):
+        best = None
+        nd = 1e18
+        for e in self.b.entities.values():
+            if (self.is_enemy_player(e) and not self.is_infected(e)) or self.is_mob(e):
+                d = math.hypot(e.x - px, e.z - pz)
+                if d < ATTACK_RANGE and d < nd:
+                    nd = d
+                    best = e
+        if best:
+            return best.id
+        mobs = [e.id for e in self.b.entities.values() if self.is_mob(e)]
+        if mobs:
+            t = mobs[self.atk_idx % len(mobs)]
+            self.atk_idx += 1
+            return t
+        return None
+
+    def _hunt(self, px, pz, invader):
+        eid = invader.id
+        ex, ez = invader.x, invader.z
+        d = math.hypot(ex - px, ez - pz)
+        if d <= CHASE_LOCK_R:
+            return ('lock', ex, ez)
+
+        slot = 0
+        if self.coord:
+            slot = self.coord.register_hunter(eid, self.my_name)
+
+        pev = self._prev_ex.get(eid, ex)
+        pez = self._prev_ez.get(eid, ez)
+        evx = ex - pev
+        evz = ez - pez
+        self._prev_ex[eid] = ex
+        self._prev_ez[eid] = ez
+
+        vmag = math.hypot(evx, evz)
+        if vmag > 0.01:
+            ndx, ndz = evx / vmag, evz / vmag
+        else:
+            ndx, ndz = (px - ex) / max(d, 0.01), (pz - ez) / max(d, 0.01)
+
+        ecx, ecz = int(math.floor(ex)), int(math.floor(ez))
+        if slot == 0:
+            tx = int(math.floor(ex + ndx))
+            tz = int(math.floor(ez + ndz))
+        elif slot == 1:
+            tx = int(math.floor(ex - ndx))
+            tz = int(math.floor(ez - ndz))
+        else:
+            tx, tz = ecx, ecz
+        tx = max(-ARENA_X, min(ARENA_X, tx))
+        tz = max(-ARENA_Z, min(ARENA_Z, tz))
+        return ('bfs', tx, tz)
+
+    def _do_bfs(self, px, pz, tx, tz, include_center):
+        target_cells = self.targets_around((int(math.floor(tx)), int(math.floor(tz))), include_center)
+        start = (int(math.floor(px)), int(math.floor(pz)))
+        now = self.tick_count
+        if self.path is None or self.path_idx >= len(self.path) or now - self.last_recompute > 10:
+            self.path = self.bfs(start, target_cells)
+            self.path_idx = 0
+            if self.path and self.path[0] == start:
+                self.path_idx = 1
+            self.last_recompute = now
+        dx, dz = tx - px, tz - pz
+        if self.path and self.path_idx < len(self.path):
+            while self.path_idx < len(self.path):
+                wx, wz = self.path[self.path_idx]
+                if (wx + 0.5 - px)**2 + (wz + 0.5 - pz)**2 < 1.8**2:
+                    self.path_idx += 1
+                else:
+                    break
+            if self.path_idx < len(self.path):
+                wx, wz = self.path[self.path_idx]
+                dx = (wx + 0.5) - px
+                dz = (wz + 0.5) - pz
+        return dx, dz
 
     def tick(self):
         if not self.initialized:
@@ -299,62 +433,62 @@ class Brain:
                 self.coord.release_gold(self.my_name)
         self.prev_hasFlag = hasFlag
 
-        cur_pos = (px, pz)
-        if self.prev_pos is not None:
-            self.my_vel = (cur_pos[0] - self.prev_pos[0], cur_pos[1] - self.prev_pos[1])
-        self.prev_pos = cur_pos
+        in_jail = self.in_jail(int(math.floor(px)), int(math.floor(pz)))
+        invader = self.nearest_enemy_in_my_half() if not hasFlag else None
+        hunt_result = None
+        if invader and not in_jail and math.hypot(invader.x - px, invader.z - pz) < 12:
+            hunt_result = self._hunt(px, pz, invader)
 
-        enemies = self.build_enemies(px, pz)
-        target = self.pick_target(px, pz, hasFlag)
-        is_hunting, hunt_pos = self.check_hunt(enemies, px, pz, hasFlag)
-        if is_hunting and hunt_pos is not None:
-            target = hunt_pos
-
-        forward, strafe, jump, atk = expert_agent_tick(
-            (px, pz), self.my_vel, hasFlag, enemies, target, is_hunting)
-
-        move_x = strafe
-        move_z = forward
-        flen = math.hypot(move_x, move_z)
-        if flen > 0.01:
-            yaw = math.degrees(math.atan2(-move_x, move_z)) % 360.0
-            w = True
-            sprint = self.b.hunger > 6
+        if hunt_result and hunt_result[0] == 'lock':
+            dx = hunt_result[1] - px
+            dz = hunt_result[2] - pz
+            tx, tz = hunt_result[1], hunt_result[2]
+        elif hunt_result and hunt_result[0] == 'bfs':
+            tx, tz = hunt_result[1], hunt_result[2]
+            dx, dz = self._do_bfs(px, pz, tx, tz, False)
         else:
-            yaw = math.degrees(math.atan2(-(target[0]-px), target[1]-pz)) % 360.0 if (target[0]-px)**2+(target[1]-pz)**2 > 0.01 else 0.0
+            tx, tz = self.pick_target(px, pz, hasFlag)
+            dx, dz = self._do_bfs(px, pz, tx, tz, hasFlag)
+
+        rep_x, rep_z, in_repulsion = self.compute_repulsion(px, pz)
+        final_x = dx + rep_x
+        final_z = dz + rep_z
+        flen = math.hypot(final_x, final_z)
+
+        if flen > 0.01:
+            yaw = math.degrees(math.atan2(-final_x, final_z)) % 360.0
+            w = True
+            sprint = not in_jail and self.b.hunger > 6
+            jump = False
+            ndx, ndz = final_x / flen, final_z / flen
+            ncell_x = int(math.floor(px + ndx))
+            ncell_z = int(math.floor(pz + ndz))
+            for yy in range(self.G + 2, self.G - 3, -1):
+                blk = self.b.get_block(ncell_x, yy, ncell_z)
+                if blk and not blk.passable:
+                    if yy > self.G:
+                        jump = True
+                    break
+            if in_repulsion and sprint:
+                jump = True
+            n_dist = self.nearest_enemy_dist(px, pz)
+            if n_dist < GHOST_RANGE:
+                yaw = (yaw + math.sin(self.tick_count * 3.5) * 6.0) % 360.0
+                strafe = 'a' if self.tick_count % 6 < 3 else 'd'
+            else:
+                strafe = None
+        else:
+            yaw = math.degrees(math.atan2(-dx, dz)) % 360.0 if abs(dx) + abs(dz) > 0.01 else 0.0
             w = False
             sprint = False
+            jump = False
+            strafe = None
 
-        nearest_enemy = min((len_v(sub_v(e['pos'], (px, pz))) for e in enemies if not e.get('is_parasitized')), default=999)
-        a_key = False
-        d_key = False
-        if nearest_enemy < 5.0 and not is_hunting:
-            yaw = (yaw + math.sin(self.tick_count * 3.5) * 6.0) % 360.0
-            if self.tick_count % 6 < 3:
-                a_key = True
-            else:
-                d_key = True
-        elif strafe > 0.3:
-            d_key = True
-        elif strafe < -0.3:
-            a_key = True
-
-        if hasFlag and self.b.hunger > 6:
-            jump = True
-
-        if atk is None:
-            mobs = [e['id'] for e in enemies if self.is_mob_by_id(e['id'])]
-            if mobs:
-                atk = mobs[self.atk_idx % len(mobs)]
-                self.atk_idx += 1
-
-        self.b.set(yaw=yaw, pitch=0.0, w=w, a=a_key, d=d_key,
-                   sprint=sprint, jump=jump, attack=atk)
+        attack = self.nearest_attack_target(px, pz)
+        self.b.set(yaw=yaw, pitch=0.0, w=w, a=(strafe == 'a'), d=(strafe == 'd'),
+                   sprint=sprint, jump=jump, attack=attack)
 
         if self.tick_count % 100 == 0:
+            ht = hunt_result[0] if hunt_result else 'none'
             print(f"[{self.my_name}] #{self.tick_count} ({px:.1f},{pz:.1f}) flag={hasFlag} "
-                  f"target=({target[0]:.0f},{target[1]:.0f}) hunt={is_hunting}")
-
-    def is_mob_by_id(self, eid):
-        e = self.b.entities.get(eid)
-        return e is not None and self.is_mob(e)
+                  f"target=({tx:.0f},{tz:.0f}) jail={in_jail} rep={in_repulsion} hunt={ht}")
