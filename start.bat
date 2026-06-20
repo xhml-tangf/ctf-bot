@@ -10,7 +10,7 @@ REM ====== Match params (edit these) ======
 REM Player names (comma-separated, controls all of them)
 set "CTF_PLAYERS=tang_fuqing,wang_simu,ling_jiayou"
 set "CTF_ENEMY=trivial"
-set "CTF_MAP=random"
+set "CTF_MAP=fixed"
 REM Players count is auto = number of names above
 REM ==========================================
 REM Server address (use ws://127.0.0.1:8080 for local test)
